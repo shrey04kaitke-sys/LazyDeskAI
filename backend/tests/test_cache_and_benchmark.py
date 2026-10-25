@@ -6,6 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main
+from apply_helpers import apply_moves  # noqa: E402
 
 
 @pytest.fixture
@@ -51,7 +52,7 @@ def test_plan_fingerprint_catches_a_same_size_same_mtime_swap_of_a_known_extensi
     assert action["source_fingerprint"] and len(action["source_fingerprint"]) == 64
     assert client.post(f"/api/plans/{created['id']}/approve", json={"action_ids": [action["id"]]}).status_code == 200
     swap_content_keeping_size_and_mtime(note, b"bbbb")
-    response = client.post("/api/execute", json={"plan_id": created["id"], "action_ids": [action["id"]]})
+    response = apply_moves(client, created["id"], [action["id"]])
     assert response.status_code == 409 and "content changed" in response.json()["detail"]
     assert note.read_bytes() == b"bbbb" and not (workspace / "documents").exists()
 

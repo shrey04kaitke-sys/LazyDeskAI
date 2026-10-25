@@ -1,4 +1,4 @@
-# Creates the synthetic demo workspace under %LOCALAPPDATA%\LazyDeskDemo (never inside this repo or your personal folders).
+# Creates the synthetic demo workspace under %USERPROFILE%\LazyDeskDemo (never inside this repo or your personal folders).
 # Safe to re-run: it rebuilds only that marked demo folder.
 param([string]$Base = "")
 $ErrorActionPreference = "Stop"

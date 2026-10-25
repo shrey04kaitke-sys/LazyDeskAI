@@ -1,7 +1,7 @@
 """Create, reset or remove an isolated, synthetic LazyDesk demo workspace and database.
 
 Standard library only. Everything lives under one folder named LazyDeskDemo (default:
-%LOCALAPPDATA%\\LazyDeskDemo) that is marked with a marker file. The commands refuse to touch any other
+%USERPROFILE%\\LazyDeskDemo) that is marked with a marker file. The commands refuse to touch any other
 folder, so they cannot reach personal data or the real backend/lazydesk.db.
 
     python demo_workspace.py setup  [--base PATH]   create the workspace (rebuilds an existing demo)
@@ -34,8 +34,8 @@ class DemoSafetyError(Exception):
 
 
 def default_base() -> Path:
-    local = os.environ.get("LOCALAPPDATA")
-    return (Path(local) if local else Path.home() / ".local" / "share") / DEMO_DIR_NAME
+    # Directly under the profile, not AppData: LazyDesk refuses AppData as a workspace location.
+    return Path.home() / DEMO_DIR_NAME
 
 
 def is_link_like(path: Path) -> bool:

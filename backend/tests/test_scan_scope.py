@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main
+from apply_helpers import apply_moves  # noqa: E402
 
 
 @pytest.fixture
@@ -27,6 +28,7 @@ def test_scan_below_cap_reports_complete(tmp_path: Path, client: TestClient, mon
     assert body["count"] == 3
     assert body["completeness"] == {
         "scan_root": str(root.resolve()), "files_scanned": 3, "limit": 5, "truncated": False, "complete": True,
+        "skipped_protected": [], "skipped_protected_total": 0, "skipped_links": 0, "skipped_unreadable": 0,
     }
 
 
@@ -140,7 +142,7 @@ def test_symlinked_directory_escape_is_rejected(tmp_path: Path, client: TestClie
 
 def test_filesystem_root_and_missing_root_are_refused(tmp_path: Path, client: TestClient):
     anchor = Path(tmp_path.anchor)
-    assert client.post("/api/plans", json={"workspace_root": str(anchor), "files": [str(tmp_path / "x.txt")]}).status_code == 400
+    assert client.post("/api/plans", json={"workspace_root": str(anchor), "files": [str(tmp_path / "x.txt")]}).status_code == 403  # a whole drive is refused by policy
     assert client.post("/api/plans", json={"workspace_root": str(tmp_path / "missing"), "files": ["a"]}).status_code == 404
     assert client.post("/api/plans", json={"files": ["a"]}).status_code == 422
 
@@ -153,7 +155,7 @@ def test_edit_cannot_move_destination_outside_root_and_execute_stays_inside(tmp_
     assert edited.json()["actions"][0]["validation"] == "blocked"
     client.patch(f"/api/plans/{plan['id']}/actions/{action_id}", json={"proposed_name": "renamed.pdf"})
     assert client.post(f"/api/plans/{plan['id']}/approve", json={"action_ids": [action_id]}).status_code == 200
-    result = client.post("/api/execute", json={"plan_id": plan["id"], "action_ids": [action_id]})
+    result = apply_moves(client, plan["id"], [action_id])
     assert result.status_code == 200
     assert (paper.parent / "documents" / "renamed.pdf").exists()
     assert not paper.exists()

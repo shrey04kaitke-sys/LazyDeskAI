@@ -6,12 +6,16 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main
+from apply_helpers import apply_moves  # noqa: E402
 
 
 @pytest.fixture
 def isolated_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    # The database lives NEXT TO the workspace: a workspace that contains LazyDesk's own database is refused.
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
     monkeypatch.setattr(main, "DB_PATH", tmp_path / "test.sqlite")
-    return tmp_path
+    return workspace
 
 
 def test_incremental_scan_reuses_cache_and_invalidates_same_size_content(isolated_db: Path):
@@ -77,7 +81,7 @@ def test_plan_edit_revalidates_and_execution_is_bound_to_plan(isolated_db: Path)
     )
     assert approved.status_code == 200
     document.write_text("changed", encoding="utf-8")
-    failed = client.post("/api/execute", json={"plan_id": plan["id"], "action_ids": [action["id"]]})
+    failed = apply_moves(client, plan["id"], [action["id"]])
     assert failed.status_code == 409
     assert document.exists()
 

@@ -8,7 +8,7 @@ client = TestClient(app)
 
 
 def test_health_returns_local_status():
-    response = client.get("/api/health")
+    response = client.get("/api/status")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
 

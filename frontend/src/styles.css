@@ -59,3 +59,20 @@ h1, h2, h3, p { margin: 0; } h1 { font-size: 17px; letter-spacing: -.02em; } h2 
 .statusbar { position: fixed; bottom: 0; right: 0; left: 190px; height: 31px; background: #e9ebe5; border-top: 1px solid #d6dad2; color: #718075; display: flex; align-items: center; gap: 25px; padding: 0 18px; font: 10px "IBM Plex Mono", monospace; } .statusbar span { display: flex; align-items: center; gap: 6px; } .statusbar span:nth-child(2) { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .spin { animation: spin 1s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
 @media (max-width: 1150px) { .rail { width: 68px; flex-basis: 68px; align-items: center; } .rail-label, .nav-item span { display: none; } .nav-item { justify-content: center; padding: 10px; } .statusbar { left: 68px; } .content { padding-left: 23px; padding-right: 23px; } }
+
+.model-note { display: block; font-style: italic; }
+.suggestion-row { display: flex; gap: 12px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
+.review-main small { display: block; }
+.review-main { min-width: 0; overflow-wrap: anywhere; }
+
+/* Apply / Undo confirmation dialog */
+.dialog-backdrop { position: fixed; inset: 0; background: rgba(15, 23, 42, 0.5); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 16px; }
+.dialog { background: #fff; border-radius: 12px; max-width: 720px; width: 100%; max-height: 85vh; overflow: auto; padding: 20px 24px; box-shadow: 0 20px 50px rgba(0, 0, 0, 0.25); }
+.dialog h3 { margin: 0 0 8px; }
+.dialog-body p { margin: 8px 0; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
+.move-list { padding-left: 20px; margin: 8px 0; font-size: 13px; word-break: break-all; }
+.move-list li { margin: 4px 0; }
+.runs-panel { margin-bottom: 20px; }
+.runs-panel .activity-item { align-items: center; }
+.runs-panel .activity-item .button { margin-left: auto; }

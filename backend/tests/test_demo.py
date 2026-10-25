@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main
+from apply_helpers import apply_moves  # noqa: E402
 
 DEMO_SCRIPT = Path(__file__).resolve().parents[2] / "demo" / "demo_workspace.py"
 spec = importlib.util.spec_from_file_location("demo_workspace", DEMO_SCRIPT)
@@ -192,6 +193,6 @@ def test_demo_walkthrough_scan_duplicates_and_review_without_applying(base: Path
     assert destinations["Projects/Beta/notes.txt"] == "Projects/Beta/documents/notes.txt"  # same name as Alpha/notes.txt, no clash
     assert destinations["Archive/2023/mystery.xyz"] == "Archive/2023/other/mystery.xyz"
 
-    unapproved = client.post("/api/execute", json={"plan_id": plan.json()["id"], "action_ids": [actions[0]["id"]]})
+    unapproved = apply_moves(client, plan.json()["id"], [actions[0]["id"]])
     assert unapproved.status_code == 409
     assert snapshot(workspace) == before  # the demo files are exactly as generated

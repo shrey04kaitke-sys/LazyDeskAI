@@ -11,10 +11,12 @@ if (Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyCon
     throw "Port $Port is already in use (probably your normal backend). Stop it first so the demo database is used."
 }
 $env:LAZYDESK_DB = $paths.database
+$env:LAZYDESK_PORT = "$Port"   # the API guard only accepts Host values on this port
 Write-Host "Demo database : $($paths.database)"
 Write-Host "Scan this path: $($paths.workspace)"
 Write-Host "Frontend      : cd frontend; npm run dev  ->  http://127.0.0.1:5173"
+if ($Port -ne 8000) { Write-Host "Non-default port: start the frontend with `$env:LAZYDESK_PORT='$Port'; npm run dev so the UI uses the same port." }
 Write-Host "Nothing is approved or applied automatically; do not click Apply unless you want the demo files moved."
 Push-Location (Join-Path $PSScriptRoot "..\backend")
 try { & python -m uvicorn app.main:app --host 127.0.0.1 --port $Port }
-finally { Pop-Location; Remove-Item Env:LAZYDESK_DB -ErrorAction SilentlyContinue }
+finally { Pop-Location; Remove-Item Env:LAZYDESK_DB -ErrorAction SilentlyContinue; Remove-Item Env:LAZYDESK_PORT -ErrorAction SilentlyContinue }

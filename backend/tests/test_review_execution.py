@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import main
+from apply_helpers import apply_moves  # noqa: E402
 
 
 @pytest.fixture
@@ -29,7 +30,7 @@ def approve(client: TestClient, plan: dict, *ids: str):
 
 
 def execute(client: TestClient, plan: dict, *ids: str):
-    return client.post("/api/execute", json={"plan_id": plan["id"], "action_ids": list(ids)})
+    return apply_moves(client, plan["id"], list(ids))
 
 
 def test_approved_action_moves_file_and_cannot_run_twice(workspace: Path, client: TestClient):

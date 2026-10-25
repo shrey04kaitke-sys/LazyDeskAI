@@ -1,6 +1,8 @@
 backend/lazydesk.db
 backend/lazydesk.db-*
 *.db
+*.db.lock
+*.sqlite.lock
 *.sqlite
 *.sqlite-*
 .pytest_cache/
