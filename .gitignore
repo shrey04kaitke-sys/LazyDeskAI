@@ -17,3 +17,14 @@ frontend/dist/
 frontend/*.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
+
+# generated recordings and demo media (kept outside the repository)
+*.webm
+*.mp4
+*.wav
+*.mov
+*.mkv
+
+# local demo output
+LazyDeskDemo/
+.claude/
