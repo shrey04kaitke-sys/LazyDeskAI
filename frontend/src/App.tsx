@@ -40,7 +40,7 @@ type FileItem = {
 type PlanAction = {
   id: string; source: string; proposed_name: string; current_location: string;
   proposed_destination: string; source_type: "local-rule" | "ollama";
-  validation: "safe" | "warning" | "blocked"; reason: string; status: "pending" | "approved" | "rejected";
+  validation: "safe" | "warning" | "blocked"; reason: string; status: "pending" | "approved" | "rejected" | "executed";
 };
 type Plan = { id: string; created_at: string; actions: PlanAction[] };
 type Benchmark = {
@@ -79,7 +79,10 @@ function fileIcon(extension: string) {
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${API}${path}`, { headers: { "Content-Type": "application/json" }, ...options });
   const payload = await response.json();
-  if (!response.ok) throw new Error(payload.detail ?? "The local API request failed.");
+  if (!response.ok) {
+    const detail = payload.detail;
+    throw new Error(typeof detail === "string" ? detail : detail?.message ?? "The local API request failed.");
+  }
   return payload as T;
 }
 
@@ -211,16 +214,26 @@ function ReviewView({ plan, onBack, onPlanChange }: { plan: Plan | null; onBack:
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [drafts, setDrafts] = useState<Record<string, string>>({});
-  const approveAndExecute = async () => {
-    if (!plan) return;
-    const approved = plan.actions.filter((action) => action.validation !== "blocked").map((action) => action.id);
-    if (!approved.length) return;
+  const approvable = (action: PlanAction) => action.status === "pending" && action.validation !== "blocked";
+  const approveActions = async (ids: string[]) => {
+    if (!plan || !ids.length) return;
     setBusy(true); setMessage("");
     try {
-      const updated = await api<Plan>(`/plans/${plan.id}/approve`, { method: "POST", body: JSON.stringify({ action_ids: approved }) });
+      const updated = await api<Plan>(`/plans/${plan.id}/approve`, { method: "POST", body: JSON.stringify({ action_ids: ids }) });
       onPlanChange(updated);
-      const result = await api<{ count: number }>("/execute", { method: "POST", body: JSON.stringify({ plan_id: plan.id, action_ids: approved }) });
+      setMessage(`${ids.length} proposal(s) approved. Nothing has been moved yet.`);
+    } catch (cause) { setMessage(cause instanceof Error ? cause.message : "Approval failed."); }
+    finally { setBusy(false); }
+  };
+  const applyApproved = async () => {
+    if (!plan) return;
+    const ids = plan.actions.filter((action) => action.status === "approved").map((action) => action.id);
+    if (!ids.length) return;
+    setBusy(true); setMessage("");
+    try {
+      const result = await api<{ count: number }>("/execute", { method: "POST", body: JSON.stringify({ plan_id: plan.id, action_ids: ids }) });
       setMessage(`${result.count} approved operation(s) applied.`);
+      onPlanChange({ ...plan, actions: plan.actions.map((action) => ids.includes(action.id) ? { ...action, status: "executed" } : action) });
     } catch (cause) { setMessage(cause instanceof Error ? cause.message : "Execution failed."); }
     finally { setBusy(false); }
   };
@@ -241,8 +254,8 @@ function ReviewView({ plan, onBack, onPlanChange }: { plan: Plan | null; onBack:
       setMessage("Destination validated by the backend.");
     } catch (cause) { setMessage(cause instanceof Error ? cause.message : "Unable to validate destination."); }
   };
-  return <section className="content"><div className="page-heading compact"><div><p className="eyebrow">REVIEW QUEUE</p><h2>Proposed changes</h2><p className="muted">Nothing is applied until a safe execution flow is available and you explicitly approve it.</p></div><button className="button secondary" onClick={onBack}>Back to files</button></div>
-    {!plan ? <EmptyState icon={<ClipboardCheck size={26} />} title="No plan to review" text="Select files from the Files workspace to create a local organization plan." /> : <><div className="review-summary"><div><strong>{plan.actions.length}</strong><span>proposals</span></div><div><strong>{plan.actions.filter((action) => action.validation === "safe").length}</strong><span>safe</span></div><div><strong>{plan.actions.filter((action) => action.validation === "blocked").length}</strong><span>blocked</span></div><span className="review-note"><ShieldCheck size={15} />Every destination is validated on the backend.</span><button className="button primary" onClick={approveAndExecute} disabled={busy || !plan.actions.some((action) => action.validation !== "blocked")}>{busy ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}Approve and apply</button></div>{message && <div className="alert inline">{message}</div>}<div className="review-list">{plan.actions.map((action) => <div className="review-card" key={action.id}><div className="review-icon">{action.validation === "blocked" ? <X size={17} /> : action.validation === "warning" ? <AlertTriangle size={17} /> : <Check size={17} />}</div><div className="review-main"><div className="review-title"><input className="review-name-input" value={drafts[action.id] ?? action.proposed_name} onChange={(event) => setDrafts((current) => ({ ...current, [action.id]: event.target.value }))} onBlur={() => saveName(action)} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} aria-label={`Proposed name for ${action.proposed_name}`} /><span className={`validation ${action.status === "rejected" ? "blocked" : action.validation}`}>{action.status === "rejected" ? "rejected" : action.validation}</span></div><div className="before-after"><span>{action.current_location}</span><ChevronRight size={15} /><span>{action.proposed_destination}</span></div><p>{action.reason}</p><small>Suggestion source: {action.source_type === "ollama" ? "Ollama" : "Local rule"}</small></div><button className="icon-button" onClick={() => reject(action)} disabled={action.status === "rejected" || action.validation === "blocked"} title="Reject suggestion" aria-label={`Reject ${action.proposed_name}`}><X size={16} /></button></div>)}</div></>}
+  return <section className="content"><div className="page-heading compact"><div><p className="eyebrow">REVIEW QUEUE</p><h2>Proposed changes</h2><p className="muted">Review each proposal, approve the ones you want, then apply them. Nothing moves until you apply approved proposals.</p></div><button className="button secondary" onClick={onBack}>Back to files</button></div>
+    {!plan ? <EmptyState icon={<ClipboardCheck size={26} />} title="No plan to review" text="Select files from the Files workspace to create a local organization plan." /> : <><div className="review-summary"><div><strong>{plan.actions.length}</strong><span>proposals</span></div><div><strong>{plan.actions.filter((action) => action.validation === "safe").length}</strong><span>safe</span></div><div><strong>{plan.actions.filter((action) => action.validation === "blocked").length}</strong><span>blocked</span></div><span className="review-note"><ShieldCheck size={15} />Every destination is validated on the backend.</span><button className="button secondary" onClick={() => approveActions(plan.actions.filter(approvable).map((action) => action.id))} disabled={busy || !plan.actions.some(approvable)}>Approve all valid</button><button className="button primary" onClick={applyApproved} disabled={busy || !plan.actions.some((action) => action.status === "approved")}>{busy ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}Apply {plan.actions.filter((action) => action.status === "approved").length} approved</button></div>{message && <div className="alert inline">{message}</div>}<div className="review-list">{plan.actions.map((action) => <div className="review-card" key={action.id}><div className="review-icon">{action.validation === "blocked" ? <X size={17} /> : action.validation === "warning" ? <AlertTriangle size={17} /> : <Check size={17} />}</div><div className="review-main"><div className="review-title"><input className="review-name-input" value={drafts[action.id] ?? action.proposed_name} onChange={(event) => setDrafts((current) => ({ ...current, [action.id]: event.target.value }))} onBlur={() => saveName(action)} onKeyDown={(event) => { if (event.key === "Enter") event.currentTarget.blur(); }} aria-label={`Proposed name for ${action.proposed_name}`} /><span className={`validation ${action.status === "rejected" ? "blocked" : action.validation}`}>{action.status === "rejected" ? "rejected" : action.status === "approved" ? "approved" : action.status === "executed" ? "applied" : action.validation}</span></div><div className="before-after"><span>{action.current_location}</span><ChevronRight size={15} /><span>{action.proposed_destination}</span></div><p>{action.reason}</p><small>Suggestion source: {action.source_type === "ollama" ? "Ollama" : "Local rule"}</small></div><button className="icon-button" onClick={() => approveActions([action.id])} disabled={busy || !approvable(action)} title="Approve suggestion" aria-label={`Approve ${action.proposed_name}`}><Check size={16} /></button><button className="icon-button" onClick={() => reject(action)} disabled={action.status === "rejected" || action.status === "executed"} title="Reject suggestion" aria-label={`Reject ${action.proposed_name}`}><X size={16} /></button></div>)}</div></>}
   </section>;
 }
 

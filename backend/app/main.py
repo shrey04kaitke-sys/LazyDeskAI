@@ -66,7 +66,7 @@ class PlanAction(BaseModel):
     source_type: Literal["local-rule", "ollama", "cache"]
     validation: Literal["safe", "warning", "blocked"]
     reason: str
-    status: Literal["pending", "approved", "rejected"] = "pending"
+    status: Literal["pending", "approved", "rejected", "executed"] = "pending"
     workspace_root: str = ""
     source_size: int = -1
     source_mtime_ns: int = -1
@@ -486,9 +486,10 @@ def scan(request: ScanRequest) -> dict[str, Any]:
 def plans(request: PlanRequest) -> PlanResponse:
     if not request.files:
         raise HTTPException(status_code=400, detail="Select at least one file to create a plan.")
-    paths = [Path(raw).expanduser().resolve() for raw in request.files]
+    unresolved = [Path(raw).expanduser() for raw in request.files]
+    paths = [path.resolve() for path in unresolved]
     roots = {path.parent for path in paths}
-    if len(roots) != 1 or any(not path.is_file() or path.is_symlink() for path in paths):
+    if len(roots) != 1 or any(not path.is_file() or path.is_symlink() for path in paths) or any(path.is_symlink() for path in unresolved):
         raise HTTPException(status_code=400, detail="Files must exist, be regular files, and share one parent directory.")
     actions = [action_for(path, next(iter(roots))) for path in paths]
     plan = PlanResponse(id=hashlib.sha256(f"{utc_now()}:{paths}".encode()).hexdigest()[:16], created_at=utc_now(), actions=actions)
@@ -523,6 +524,9 @@ def edit_action(plan_id: str, action_id: str, request: EditActionRequest) -> Pla
     if action is None:
         connection.close()
         raise HTTPException(status_code=404, detail="Plan action was not found.")
+    if action.status == "executed":
+        connection.close()
+        raise HTTPException(status_code=409, detail="This action has already been executed and cannot be edited.")
     source = Path(action.source)
     if not source.is_file() or source.is_symlink():
         action.validation, action.reason = "blocked", "The source file is stale or no longer a regular file."
@@ -530,6 +534,8 @@ def edit_action(plan_id: str, action_id: str, request: EditActionRequest) -> Pla
         updated = action_for(source, Path(action.workspace_root), request.proposed_name)
         action.proposed_name, action.proposed_destination = updated.proposed_name, updated.proposed_destination
         action.validation, action.reason = updated.validation, updated.reason
+    # Any edit voids a previous approval; a rejection is never silently reversed.
+    if action.status == "approved":
         action.status = "pending"
     save_plan(connection, plan_id, actions)
     connection.close()
@@ -547,9 +553,18 @@ def approve(plan_id: str, request: ApprovalRequest) -> PlanResponse:
         raise HTTPException(status_code=400, detail="Approval contains an action from another plan.")
     for action in actions:
         if action.id in selected:
+            if action.status in ("rejected", "executed"):
+                connection.close()
+                raise HTTPException(status_code=409, detail=f"Action {action.id} is {action.status} and cannot be approved.")
             if action.validation == "blocked":
                 connection.close()
                 raise HTTPException(status_code=409, detail=f"Action {action.id} is blocked and cannot be approved.")
+            problem = execution_problem(action)
+            if problem:
+                connection.close()
+                raise HTTPException(status_code=409, detail=f"Action {action.id} cannot be approved: {problem}")
+    for action in actions:
+        if action.id in selected:
             action.status = "approved"
     save_plan(connection, plan_id, actions)
     connection.close()
@@ -562,56 +577,103 @@ def reject(plan_id: str, request: ApprovalRequest) -> PlanResponse:
     connection = db()
     row, actions = load_plan(connection, plan_id)
     selected = set(request.action_ids)
+    if not selected.issubset({item.id for item in actions}):
+        connection.close()
+        raise HTTPException(status_code=400, detail="Rejection contains an action from another plan.")
     for action in actions:
         if action.id in selected:
+            if action.status == "executed":
+                connection.close()
+                raise HTTPException(status_code=409, detail=f"Action {action.id} has already been executed.")
             action.status = "rejected"
     save_plan(connection, plan_id, actions)
     connection.close()
+    record_activity("rejection", f"Rejected {len(selected)} proposal(s) in plan {plan_id}")
     return PlanResponse(id=row["id"], created_at=row["created_at"], actions=actions)
+
+
+def execution_problem(action: PlanAction) -> str | None:
+    """Re-check an action against the live filesystem. Returns a reason it must not run, or None."""
+    root, source, destination = Path(action.workspace_root), Path(action.source), Path(action.proposed_destination)
+    try:
+        if not action.workspace_root or not root.is_dir() or root.is_symlink():
+            return "the workspace is missing or unsafe"
+        resolved_root = root.resolve()
+        if not SAFE_NAME.fullmatch(destination.name):
+            return "the destination filename is invalid"
+        if not source.is_file() or not is_symlink_safe(source, resolved_root):
+            return "the source is missing, not a regular file, or unsafe"
+        try:
+            destination.resolve().relative_to(resolved_root)
+        except ValueError:
+            return "the destination is outside the workspace"
+        if destination.is_symlink() or destination.exists():
+            return "the destination is occupied"
+        if source.resolve() == destination.resolve():
+            return "the destination is unchanged"
+        current = source.stat()
+        if current.st_size != action.source_size or current.st_mtime_ns != action.source_mtime_ns:
+            return "the source file changed since the plan was created"
+        if action.source_fingerprint and content_fingerprint(source) != action.source_fingerprint:
+            return "the source content changed since the plan was created"
+    except OSError as error:
+        return f"the filesystem could not be checked ({error})"
+    return None
+
+
+def move_file(source: Path, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not is_symlink_safe(destination.parent, destination.parent):
+        raise OSError("destination folder is a symbolic link")
+    source.rename(destination)
 
 
 @app.post("/api/execute")
 def execute(request: ExecuteRequest) -> dict[str, Any]:
     if not request.action_ids:
         raise HTTPException(status_code=400, detail="Select at least one approved action.")
+    action_ids = list(dict.fromkeys(request.action_ids))
     connection = db()
     _, actions = load_plan(connection, request.plan_id)
     action_map = {action.id: action for action in actions}
-    if not set(request.action_ids).issubset(action_map):
+    if not set(action_ids).issubset(action_map):
         connection.close()
         raise HTTPException(status_code=400, detail="Execution contains an action from another plan.")
-    moved: list[str] = []
-    for action_id in request.action_ids:
+    # Preflight every action before touching anything, so a bad batch changes nothing.
+    destinations: set[str] = set()
+    for action_id in action_ids:
         action = action_map[action_id]
+        problem = None
         if action.status != "approved":
+            problem = f"it is {action.status}, not approved"
+        elif action.validation == "blocked":
+            problem = "it is blocked"
+        elif action.proposed_destination in destinations:
+            problem = "another action in this batch targets the same destination"
+        else:
+            problem = execution_problem(action)
+        if problem:
             connection.close()
-            raise HTTPException(status_code=409, detail=f"Action {action_id} has not been approved in this plan.")
-        root, source, destination = Path(action.workspace_root), Path(action.source), Path(action.proposed_destination)
-        if not is_symlink_safe(root, root) or not is_symlink_safe(source, root) or destination.is_symlink():
-            connection.close()
-            raise HTTPException(status_code=409, detail=f"Action {action_id} contains an unsafe path.")
+            raise HTTPException(status_code=409, detail=f"Action {action_id} was not executed: {problem}.")
+        destinations.add(action.proposed_destination)
+    # Moves are performed one by one and are NOT atomic or reversible: on a failure the
+    # earlier moves stay applied and are reported, and the remaining ones are not attempted.
+    moved: list[str] = []
+    failure: str | None = None
+    for action_id in action_ids:
+        action = action_map[action_id]
         try:
-            current_stat = source.stat()
-            source.relative_to(root)
-            destination.relative_to(root)
-        except (FileNotFoundError, ValueError) as error:
-            connection.close()
-            raise HTTPException(status_code=409, detail=f"Action {action_id} is stale or outside its workspace.") from error
-        if current_stat.st_size != action.source_size or current_stat.st_mtime_ns != action.source_mtime_ns or destination.exists():
-            connection.close()
-            raise HTTPException(status_code=409, detail=f"Action {action_id} is stale or its destination is occupied.")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        if destination.is_symlink() or not is_symlink_safe(destination.parent, root):
-            connection.close()
-            raise HTTPException(status_code=409, detail=f"Action {action_id} has an unsafe destination.")
-        try:
-            source.replace(destination)
+            move_file(Path(action.source), Path(action.proposed_destination))
         except OSError as error:
-            connection.close()
-            raise HTTPException(status_code=500, detail=f"Operation {action_id} failed: {error}") from error
+            failure = f"Operation {action_id} failed: {error}"
+            break
+        action.status = "executed"
         moved.append(action_id)
+    save_plan(connection, request.plan_id, actions)
     connection.close()
-    record_activity("execution", f"Executed {len(moved)} approved file operation(s) from plan {request.plan_id}")
+    record_activity("execution", f"Executed {len(moved)} of {len(action_ids)} approved file operation(s) from plan {request.plan_id}")
+    if failure:
+        raise HTTPException(status_code=500, detail={"message": failure, "moved": moved, "not_attempted": [i for i in action_ids if i not in moved and i != action_id]})
     return {"moved": moved, "count": len(moved), "plan_id": request.plan_id}
 
 
