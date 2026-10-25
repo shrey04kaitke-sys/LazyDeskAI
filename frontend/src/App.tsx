@@ -36,6 +36,7 @@ type View = "workspace" | "files" | "review" | "duplicates" | "activity" | "perf
 type FileItem = {
   id: string; name: string; path: string; relative_path: string; extension: string;
   size: number; modified_at: string; is_directory: boolean;
+  category?: string; classification_source?: string; classification_reason?: string;
 };
 type PlanAction = {
   id: string; source: string; proposed_name: string; current_location: string;
@@ -49,8 +50,29 @@ type Benchmark = {
   baseline_duration_ms: number; throughput: number; classification_quality: string; path: string;
   mode: "workspace" | "synthetic"; cold: { files: number; processed: number; cache_hits: number; duration_ms: number };
   warm: { files: number; processed: number; cache_hits: number; duration_ms: number };
+  optimized_cold?: { files: number; processed: number; cache_hits: number; duration_ms: number };
+  samples?: Record<string, number[]>; discovery_ms?: number; results_match?: boolean;
+  speedup_warm_vs_baseline?: number; methodology?: string;
 };
+type Processing = { cache_hits: number; cache_misses: number; model_requests: number; model_fallbacks: number };
+
+export function scanSummary(count: number, truncated: boolean, processing?: Processing) {
+  const base = truncated ? `${count} files shown — scan incomplete` : `${count} files discovered`;
+  if (!processing?.model_fallbacks) return base;
+  return `${base}. ${processing.model_fallbacks} file(s) used the built-in rules because the local model was unavailable, invalid or over its per-scan limit.`;
+}
+type Completeness = { scan_root: string; files_scanned: number; limit: number; truncated: boolean; complete: boolean };
 const API = "http://127.0.0.1:8000/api";
+
+export function incompleteScanMessage(info: Completeness | null) {
+  if (!info?.truncated) return "";
+  return `Incomplete scan: only the first ${info.files_scanned.toLocaleString()} files were examined because LazyDesk stops at ${info.limit.toLocaleString()} files. More files exist in ${info.scan_root} that are not shown, planned or checked for duplicates.`;
+}
+
+function ScanWarning({ info }: { info: Completeness | null }) {
+  const message = incompleteScanMessage(info);
+  return message ? <div className="alert error" role="alert"><AlertTriangle size={17} /><span>{message}</span></div> : null;
+}
 
 const navItems: { id: View; label: string; icon: typeof LayoutDashboard }[] = [
   { id: "workspace", label: "Workspace", icon: LayoutDashboard },
@@ -91,6 +113,7 @@ export default function App() {
   const [path, setPath] = useState("");
   const [activePath, setActivePath] = useState("");
   const [files, setFiles] = useState<FileItem[]>([]);
+  const [completeness, setCompleteness] = useState<Completeness | null>(null);
   const [selected, setSelected] = useState<string[]>([]);
   const [plan, setPlan] = useState<Plan | null>(null);
   const [benchmark, setBenchmark] = useState<Benchmark | null>(null);
@@ -108,9 +131,9 @@ export default function App() {
     if (!nextPath) return;
     setLoading(true); setError("");
     try {
-      const result = await api<{ path: string; items: FileItem[] }>(`/scan`, { method: "POST", body: JSON.stringify({ path: nextPath }) });
-      setFiles(result.items); setActivePath(result.path); setSelected([]);
-      setToast(`${result.items.length} files discovered`);
+      const result = await api<{ path: string; items: FileItem[]; completeness: Completeness; processing?: Processing }>(`/scan`, { method: "POST", body: JSON.stringify({ path: nextPath }) });
+      setFiles(result.items); setActivePath(result.path); setSelected([]); setCompleteness(result.completeness);
+      setToast(scanSummary(result.items.length, result.completeness.truncated, result.processing));
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to scan this folder."); }
     finally { setLoading(false); }
   };
@@ -121,24 +144,29 @@ export default function App() {
     api<{ items: typeof activity }>("/activity").then((result) => setActivity(result.items)).catch(() => undefined);
   }, []);
 
+  useEffect(() => {
+    if (view === "activity") api<{ items: typeof activity }>("/activity").then((result) => setActivity(result.items)).catch(() => undefined);
+  }, [view]);
+
   const visibleFiles = useMemo(() => files.filter((file) => file.name.toLowerCase().includes(search.toLowerCase())), [files, search]);
   const selectedFiles = files.filter((file) => selected.includes(file.id));
 
   const createPlan = async () => {
     setLoading(true); setError("");
     try {
-      const result = await api<Plan>("/plans", { method: "POST", body: JSON.stringify({ files: selectedFiles.map((file) => file.path) }) });
+      const result = await api<Plan>("/plans", { method: "POST", body: JSON.stringify({ workspace_root: activePath, files: selectedFiles.map((file) => file.path) }) });
       setPlan(result); setView("review"); setToast("Review plan created; nothing has been changed.");
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to create a review plan."); }
     finally { setLoading(false); }
   };
 
-  const runBenchmark = async () => {
-    if (!activePath) return;
+  const runBenchmark = async (synthetic = false) => {
+    if (!synthetic && !activePath) return;
     setLoading(true); setError("");
     try {
-      const result = await api<Benchmark>("/benchmarks", { method: "POST", body: JSON.stringify({ path: activePath }) });
-      setBenchmark(result); setHistory((current) => [result, ...current]); setToast("Benchmark completed from actual scan data.");
+      const body = synthetic ? { synthetic_files: 200 } : { path: activePath };
+      const result = await api<Benchmark>("/benchmarks", { method: "POST", body: JSON.stringify(body) });
+      setBenchmark(result); setHistory((current) => [result, ...current]); setToast(synthetic ? "Synthetic benchmark completed (temporary files, temporary cache)." : "Benchmark completed from actual scan data.");
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to run benchmark."); }
     finally { setLoading(false); }
   };
@@ -169,15 +197,17 @@ export default function App() {
           </div>
         </header>
         {error && <div className="alert error"><AlertTriangle size={17} /><span>{error}</span><button onClick={() => setError("")} aria-label="Dismiss error"><X size={15} /></button></div>}
+        <ScanWarning info={completeness} />
         {toast && <div className="toast"><Check size={16} />{toast}<button onClick={() => setToast("")} aria-label="Dismiss message"><X size={14} /></button></div>}
-        {view === "workspace" && <Workspace path={path} setPath={setPath} activePath={activePath} files={files} selected={selected} loading={loading} onScan={() => loadWorkspace(path)} onOpen={() => setView("files")} onReview={createPlan} onBenchmark={runBenchmark} ollama={ollama} />}
+        {view === "workspace" && <Workspace path={path} setPath={setPath} activePath={activePath} files={files} selected={selected} loading={loading} onScan={() => loadWorkspace(path)} onOpen={() => setView("files")} onReview={createPlan} onBenchmark={() => runBenchmark()} ollama={ollama} />}
         {view === "files" && <FilesView activePath={activePath} files={visibleFiles} selected={selected} search={search} setSearch={setSearch} loading={loading} toggleSelection={toggleSelection} selectAll={selectAll} onReview={createPlan} />}
         {view === "review" && <ReviewView plan={plan} onBack={() => setView("files")} onPlanChange={setPlan} />}
         {view === "duplicates" && <DuplicatesView activePath={activePath} />}
+        {view === "review" && plan && <p className="muted" style={{ padding: "0 24px" }}>Workspace boundary: {activePath}</p>}
         {view === "activity" && <ActivityView activity={activity} />}
-        {view === "performance" && <PerformanceView benchmark={benchmark} history={history} onRun={runBenchmark} activePath={activePath} />}
+        {view === "performance" && <PerformanceView benchmark={benchmark} history={history} onRun={runBenchmark} activePath={activePath} loading={loading} />}
         {view === "settings" && <SettingsView ollama={ollama} models={models} selectedModel={selectedModel} onModelChange={setSelectedModel} />}
-        <footer className="statusbar"><span><ShieldCheck size={14} /> Local-only mode</span><span>{activePath || "No folder selected"}</span><span>{files.length ? `${files.length} files` : "Ready"}</span></footer>
+        <footer className="statusbar"><span><ShieldCheck size={14} /> Local-only mode</span><span>{activePath || "No folder selected"}</span><span>{files.length ? `${files.length} files${completeness?.truncated ? " (incomplete scan)" : ""}` : "Ready"}</span></footer>
       </main>
     </div>
   );
@@ -206,7 +236,7 @@ function FilesView({ activePath, files, selected, search, setSearch, loading, to
   }), [files, extensionFilter, descending]);
   return <section className="content"><div className="page-heading compact"><div><p className="eyebrow">FILES</p><h2>File workspace</h2><div className="breadcrumbs"><FolderOpen size={15} />{activePath || "Select a folder from Workspace"}</div></div><button className="button primary" onClick={onReview} disabled={!selected.length}>Review {selected.length || ""} selected <ChevronRight size={15} /></button></div>
     <div className="toolbar"><div className="search-box"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search files" aria-label="Search files" /></div><select className="filter-button" value={extensionFilter} onChange={(event) => setExtensionFilter(event.target.value)} aria-label="Filter by extension"><option value="all">All types</option>{extensions.map((extension) => <option key={extension} value={extension}>.{extension}</option>)}</select><button className="filter-button" onClick={() => setDescending((current) => !current)}><ArrowDownUp size={15} />Name {descending ? "Z–A" : "A–Z"}</button></div>
-    <div className="file-table"><div className="file-table-head"><label><input type="checkbox" checked={displayFiles.length > 0 && displayFiles.every((file) => selected.includes(file.id))} onChange={() => selectAll(displayFiles.map((file) => file.id))} aria-label="Select visible files" />Name</label><span>Type</span><span>Modified</span><span>Size</span></div>{loading ? <div className="table-empty"><LoaderCircle className="spin" />Scanning local folder…</div> : displayFiles.length ? displayFiles.map((item) => { const Icon = fileIcon(item.extension); return <div className={`file-row ${selected.includes(item.id) ? "selected" : ""}`} key={item.id}><label><input type="checkbox" checked={selected.includes(item.id)} onChange={() => toggleSelection(item.id)} aria-label={`Select ${item.name}`} /><span className="file-name"><Icon size={17} />{item.name}</span></label><span className="type-badge">.{item.extension}</span><span>{new Date(item.modified_at).toLocaleDateString()}</span><span>{formatBytes(item.size)}</span></div>; }) : <div className="table-empty"><FolderOpen size={24} /><strong>No files found</strong><span>Try another folder or adjust your search.</span></div>}</div>
+    <div className="file-table"><div className="file-table-head"><label><input type="checkbox" checked={displayFiles.length > 0 && displayFiles.every((file) => selected.includes(file.id))} onChange={() => selectAll(displayFiles.map((file) => file.id))} aria-label="Select visible files" />Name</label><span>Type</span><span>Modified</span><span>Size</span></div>{loading ? <div className="table-empty"><LoaderCircle className="spin" />Scanning local folder…</div> : displayFiles.length ? displayFiles.map((item) => { const Icon = fileIcon(item.extension); return <div className={`file-row ${selected.includes(item.id) ? "selected" : ""}`} key={item.id}><label><input type="checkbox" checked={selected.includes(item.id)} onChange={() => toggleSelection(item.id)} aria-label={`Select ${item.name}`} /><span className="file-name"><Icon size={17} />{item.name}</span></label><span className="type-badge" title={item.classification_reason ?? ""}>.{item.extension}{item.category ? ` · ${item.category}` : ""}{item.classification_source?.endsWith("ollama") ? " · AI" : ""}</span><span>{new Date(item.modified_at).toLocaleDateString()}</span><span>{formatBytes(item.size)}</span></div>; }) : <div className="table-empty"><FolderOpen size={24} /><strong>No files found</strong><span>Try another folder or adjust your search.</span></div>}</div>
   </section>;
 }
 
@@ -260,27 +290,49 @@ function ReviewView({ plan, onBack, onPlanChange }: { plan: Plan | null; onBack:
 }
 
 function ActivityView({ activity }: { activity: { id: number; kind: string; message: string; created_at: string }[] }) { return <section className="content"><div className="page-heading compact"><div><p className="eyebrow">ACTIVITY</p><h2>Recent activity</h2><p className="muted">A local record of scans, plans, and benchmark runs.</p></div></div>{activity.length ? <div className="activity-list">{activity.map((item) => <div className="activity-item" key={item.id}><span className="activity-icon"><Activity size={16} /></span><div><strong>{item.message}</strong><span>{item.kind} · {new Date(item.created_at).toLocaleString()}</span></div></div>)}</div> : <EmptyState icon={<Clock3 size={26} />} title="No activity yet" text="Your local actions will appear here as you work." />}</section>; }
-function PerformanceView({ benchmark, history, onRun, activePath }: { benchmark: Benchmark | null; history: Benchmark[]; onRun: () => void; activePath: string }) { return <section className="content"><div className="page-heading compact"><div><p className="eyebrow">PERFORMANCE</p><h2>Optimization inspection</h2><p className="muted">Measured results only. Run a benchmark against the active folder to populate this view.</p></div><button className="button primary" onClick={onRun} disabled={!activePath}><Play size={15} />Run benchmark</button></div>{benchmark ? <><div className="benchmark-banner"><BarChart3 size={19} /><div><strong>Current run · {benchmark.mode}</strong><span>{benchmark.path} · {new Date(benchmark.created_at).toLocaleString()}</span></div></div><div className="metric-grid"><Metric label="Files discovered" value={String(benchmark.files_discovered)} icon={<FolderOpen size={16} />} /><Metric label="Warm-cache hits" value={String(benchmark.warm.cache_hits)} icon={<RefreshCw size={16} />} /><Metric label="Model requests" value={String(benchmark.local_model_requests)} icon={<Sparkles size={16} />} /><Metric label="Cold → warm" value={`${benchmark.baseline_duration_ms} → ${benchmark.optimized_duration_ms} ms`} icon={<Clock3 size={16} />} /><Metric label="Warm throughput" value={`${benchmark.throughput}/s`} icon={<BarChart3 size={16} />} /><Metric label="Quality" value={benchmark.classification_quality} icon={<ShieldCheck size={16} />} /></div></> : <EmptyState icon={<BarChart3 size={26} />} title="No benchmark history" text="Run a benchmark to measure actual scan and classification behavior." />}{history.length > 0 && <div className="history"><div className="section-header"><div><p className="eyebrow">HISTORY</p><h3>Previous runs</h3></div></div>{history.map((item) => <div className="history-row" key={item.id}><span>{new Date(item.created_at).toLocaleString()}</span><span>{item.files_discovered} files</span><span>{item.optimized_duration_ms} ms warm</span><span>{item.path}</span></div>)}</div>}</section>; }
+function PerformanceView({ benchmark, history, onRun, activePath, loading }: { benchmark: Benchmark | null; history: Benchmark[]; onRun: (synthetic?: boolean) => void; activePath: string; loading: boolean }) {
+  const phase = (label: string, value?: { processed: number; cache_hits: number; duration_ms: number }) => value ? <div className="history-row" key={label}><span>{label}</span><span>{value.duration_ms} ms (median)</span><span>{value.processed} classified</span><span>{value.cache_hits} cache hits</span></div> : null;
+  return <section className="content"><div className="page-heading compact"><div><p className="eyebrow">PERFORMANCE</p><h2>Optimization inspection</h2><p className="muted">Measured results only. Timings use temporary files and a temporary cache, so they never change your data.</p></div><div className="heading-actions"><button className="button secondary" onClick={() => onRun(true)} disabled={loading}><Play size={15} />Run synthetic (200 files)</button><button className="button primary" onClick={() => onRun(false)} disabled={!activePath || loading}><Play size={15} />Run on active folder</button></div></div>
+    {benchmark ? <>
+      <div className="benchmark-banner"><BarChart3 size={19} /><div><strong>Current run · {benchmark.mode}</strong><span>{benchmark.path} · {new Date(benchmark.created_at).toLocaleString()}</span></div></div>
+      <div className="metric-grid">
+        <Metric label="Files discovered" value={String(benchmark.files_discovered)} icon={<FolderOpen size={16} />} />
+        <Metric label="Warm-cache hits" value={`${benchmark.warm.cache_hits} / ${benchmark.warm.files}`} icon={<RefreshCw size={16} />} />
+        <Metric label="Model requests" value={String(benchmark.local_model_requests)} icon={<Sparkles size={16} />} />
+        <Metric label="No cache → warm cache" value={`${benchmark.baseline_duration_ms} → ${benchmark.optimized_duration_ms} ms`} icon={<Clock3 size={16} />} />
+        <Metric label="Warm vs no cache" value={benchmark.speedup_warm_vs_baseline ? `${benchmark.speedup_warm_vs_baseline}×` : "—"} icon={<BarChart3 size={16} />} />
+        <Metric label="Results identical" value={benchmark.results_match === false ? "No" : "Yes"} icon={<ShieldCheck size={16} />} />
+      </div>
+      <div className="history"><div className="section-header"><div><p className="eyebrow">PHASES</p><h3>Same files, three ways</h3></div></div>
+        {phase("No cache (rules only)", benchmark.cold)}{phase("Cold cache (first pass)", benchmark.optimized_cold)}{phase("Warm cache (second pass)", benchmark.warm)}</div>
+      {benchmark.methodology && <p className="muted" style={{ marginTop: 12 }}>{benchmark.methodology}</p>}
+    </> : <EmptyState icon={<BarChart3 size={26} />} title="No benchmark history" text="Run a synthetic benchmark, or one on the active folder, to measure actual classification behavior." />}
+    {history.length > 0 && <div className="history"><div className="section-header"><div><p className="eyebrow">HISTORY</p><h3>Previous runs</h3></div></div>{history.map((item) => <div className="history-row" key={item.id}><span>{new Date(item.created_at).toLocaleString()}</span><span>{item.files_discovered} files</span><span>{item.baseline_duration_ms} → {item.optimized_duration_ms} ms</span><span>{item.path}</span></div>)}</div>}</section>;
+}
 function DuplicatesView({ activePath }: { activePath: string }) {
   const [groups, setGroups] = useState<{ size: number; fingerprint: string; files: string[] }[]>([]);
+  const [dupInfo, setDupInfo] = useState<Completeness | null>(null);
+  const [cloudSkipped, setCloudSkipped] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const scan = async () => {
     if (!activePath) return;
     setLoading(true); setError("");
-    try { const result = await api<{ groups: typeof groups }>("/duplicates", { method: "POST", body: JSON.stringify({ path: activePath }) }); setGroups(result.groups); }
+    try { const result = await api<{ groups: typeof groups; completeness: Completeness; skipped_cloud_only?: number }>("/duplicates", { method: "POST", body: JSON.stringify({ path: activePath }) }); setGroups(result.groups); setDupInfo(result.completeness); setCloudSkipped(result.skipped_cloud_only ?? 0); }
     catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to scan for duplicates."); }
     finally { setLoading(false); }
   };
-  return <section className="content"><div className="page-heading compact"><div><p className="eyebrow">DUPLICATES</p><h2>Exact duplicate groups</h2><p className="muted">Only identical SHA-256 content fingerprints are grouped. LazyDesk never deletes duplicates automatically.</p></div><button className="button primary" onClick={scan} disabled={!activePath || loading}>{loading ? <LoaderCircle className="spin" size={15} /> : <Copy size={15} />}Scan duplicates</button></div>{error && <div className="alert inline">{error}</div>}{groups.length ? <div className="duplicate-list">{groups.map((group) => <div className="duplicate-card" key={group.fingerprint}><div className="duplicate-heading"><strong>{group.files.length} exact matches</strong><span>{formatBytes(group.size)} each · SHA-256 {group.fingerprint.slice(0, 16)}…</span></div>{group.files.map((file) => <div className="duplicate-file" key={file}><File size={15} />{file}</div>)}</div>)}</div> : <EmptyState icon={<Copy size={26} />} title={activePath ? "No duplicate groups found" : "Select a workspace first"} text={activePath ? "Run an exact-content duplicate scan when you are ready." : "Scan a folder from Workspace before checking duplicates."} />}</section>;
+  return <section className="content"><div className="page-heading compact"><div><p className="eyebrow">DUPLICATES</p><h2>Exact duplicate groups</h2><p className="muted">Only identical SHA-256 content fingerprints are grouped. LazyDesk never deletes duplicates automatically.</p></div><button className="button primary" onClick={scan} disabled={!activePath || loading}>{loading ? <LoaderCircle className="spin" size={15} /> : <Copy size={15} />}Scan duplicates</button></div>{error && <div className="alert inline">{error}</div>}<ScanWarning info={dupInfo} />{cloudSkipped > 0 && <div className="alert inline" role="status">{cloudSkipped} cloud-only file(s) were not compared because reading them would download them.</div>}{groups.length ? <div className="duplicate-list">{groups.map((group) => <div className="duplicate-card" key={group.fingerprint}><div className="duplicate-heading"><strong>{group.files.length} exact matches</strong><span>{formatBytes(group.size)} each · SHA-256 {group.fingerprint.slice(0, 16)}…</span></div>{group.files.map((file) => <div className="duplicate-file" key={file}><File size={15} />{file}</div>)}</div>)}</div> : <EmptyState icon={<Copy size={26} />} title={activePath ? (dupInfo ? "No exact duplicates found" : "No duplicate scan yet") : "Select a workspace first"} text={activePath ? (dupInfo ? "No two scanned files have identical content." : "Run an exact-content duplicate scan when you are ready.") : "Scan a folder from Workspace before checking duplicates."} />}</section>;
 }
 function SettingsView({ ollama, models, selectedModel, onModelChange }: { ollama: boolean; models: string[]; selectedModel: string | null; onModelChange: (model: string | null) => void }) {
   const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
   const saveModel = async (model: string) => {
-    setSaving(true);
+    setSaving(true); setSaveError("");
     try { const result = await api<{ model: string | null }>("/settings", { method: "PATCH", body: JSON.stringify({ model: model || null }) }); onModelChange(result.model); }
+    catch (cause) { setSaveError(cause instanceof Error ? cause.message : "Unable to save the model selection."); }
     finally { setSaving(false); }
   };
-  return <section className="content"><div className="page-heading compact"><div><p className="eyebrow">SETTINGS</p><h2>Local preferences</h2><p className="muted">Keep control of where LazyDesk can look and which local model it can use.</p></div></div><div className="settings-list"><div className="setting-row"><div><strong>Ollama connection</strong><span>Optional local inference for richer classification suggestions.</span></div><span className={`status-pill ${ollama ? "online" : ""}`}><span className="status-dot" />{ollama ? "Connected" : "Unavailable"}</span></div><div className="setting-row"><div><strong>Classification model</strong><span>Only installed local models appear here; LazyDesk never downloads one.</span></div><select value={selectedModel ?? ""} onChange={(event) => saveModel(event.target.value)} disabled={saving || !models.length} aria-label="Ollama classification model"><option value="">Deterministic fallback</option>{models.map((model) => <option key={model} value={model}>{model}</option>)}</select></div><div className="setting-row"><div><strong>Filesystem safety</strong><span>Backend validates every path and blocks destinations outside the active workspace.</span></div><ShieldCheck size={20} className="green-icon" /></div><div className="setting-row"><div><strong>Storage</strong><span>Activity, benchmark, plan, and cache history are stored in local SQLite.</span></div><HardDrive size={20} /></div></div></section>;
+  return <section className="content"><div className="page-heading compact"><div><p className="eyebrow">SETTINGS</p><h2>Local preferences</h2><p className="muted">Keep control of where LazyDesk can look and which local model it can use.</p></div></div>{saveError && <div className="alert inline" role="alert">{saveError}</div>}<div className="settings-list"><div className="setting-row"><div><strong>Ollama connection</strong><span>Optional local inference for richer classification suggestions.</span></div><span className={`status-pill ${ollama ? "online" : ""}`}><span className="status-dot" />{ollama ? "Connected" : "Unavailable"}</span></div><div className="setting-row"><div><strong>Classification model</strong><span>Only installed local models appear here; LazyDesk never downloads one.</span></div><select value={selectedModel ?? ""} onChange={(event) => saveModel(event.target.value)} disabled={saving || !models.length} aria-label="Ollama classification model"><option value="">Deterministic fallback</option>{models.map((model) => <option key={model} value={model}>{model}</option>)}</select></div><div className="setting-row"><div><strong>Filesystem safety</strong><span>Backend validates every path and blocks destinations outside the active workspace.</span></div><ShieldCheck size={20} className="green-icon" /></div><div className="setting-row"><div><strong>Storage</strong><span>Activity, benchmark, plan, and cache history are stored in local SQLite.</span></div><HardDrive size={20} /></div></div></section>;
 }
 function EmptyState({ icon, title, text }: { icon: ReactNode; title: string; text: string }) { return <div className="empty-state">{icon}<strong>{title}</strong><span>{text}</span></div>; }
