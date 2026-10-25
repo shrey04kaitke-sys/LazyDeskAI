@@ -62,7 +62,7 @@ def test_plan_edit_revalidates_and_execution_is_bound_to_plan(isolated_db: Path)
     document = isolated_db / "notes.txt"
     document.write_text("hello", encoding="utf-8")
     client = TestClient(main.app)
-    plan = client.post("/api/plans", json={"files": [str(document)]}).json()
+    plan = client.post("/api/plans", json={"workspace_root": str(isolated_db), "files": [str(document)]}).json()
     action = plan["actions"][0]
     edited = client.patch(
         f"/api/plans/{plan['id']}/actions/{action['id']}",
@@ -88,7 +88,7 @@ def test_path_traversal_and_existing_destination_are_blocked(isolated_db: Path):
     (isolated_db / "documents").mkdir()
     (isolated_db / "documents" / "occupied.txt").write_text("existing", encoding="utf-8")
     client = TestClient(main.app)
-    plan = client.post("/api/plans", json={"files": [str(document)]}).json()
+    plan = client.post("/api/plans", json={"workspace_root": str(isolated_db), "files": [str(document)]}).json()
     action = plan["actions"][0]
     traversal = client.patch(
         f"/api/plans/{plan['id']}/actions/{action['id']}",

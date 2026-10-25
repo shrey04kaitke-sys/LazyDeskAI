@@ -21,10 +21,16 @@ from pydantic import BaseModel, Field, ValidationError, field_validator
 APP_ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = Path(os.getenv("LAZYDESK_DB", APP_ROOT / "lazydesk.db"))
 CACHE_SCHEMA_VERSION = 1
-PROCESSING_VERSION = "rules-v1"
+PROCESSING_VERSION = "rules-v2"
 MAX_SCAN_ENTRIES = 10_000
-MAX_CLASSIFICATION_BATCH = 20
+MAX_CLASSIFICATION_BATCH = 20  # model requests attempted per scan; the rest wait for the next scan
+MAX_CONSECUTIVE_MODEL_FAILURES = 2  # stop calling an unresponsive model for the rest of a scan
+FINGERPRINT_LIMIT_BYTES = 64 * 1024 * 1024  # larger files are identified by size and mtime only
+OLLAMA_TIMEOUT_SECONDS = float(os.getenv("LAZYDESK_OLLAMA_TIMEOUT", "20"))
 SAFE_NAME = re.compile(r"^[^/\\\x00-\x1f\x7f]+$")
+WINDOWS_RESERVED_NAMES = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)), *(f"lpt{i}" for i in range(1, 10))}
+# Windows file attributes that mean the content lives in the cloud and reading it would download it.
+CLOUD_ONLY_ATTRIBUTES = 0x1000 | 0x40000 | 0x400000  # OFFLINE | RECALL_ON_OPEN | RECALL_ON_DATA_ACCESS
 ALLOWED_CATEGORIES = {"documents", "images", "audio", "video", "archives", "code", "other"}
 EASY_EXTENSIONS = {
     "documents": {"txt", "md", "pdf", "doc", "docx", "rtf", "odt", "csv", "xls", "xlsx"},
@@ -54,6 +60,7 @@ class ScanRequest(BaseModel):
 
 
 class PlanRequest(BaseModel):
+    workspace_root: str = Field(min_length=1)
     files: list[str] = Field(default_factory=list, max_length=500)
 
 
@@ -71,6 +78,7 @@ class PlanAction(BaseModel):
     source_size: int = -1
     source_mtime_ns: int = -1
     source_fingerprint: str | None = None
+    category: str = ""
 
 
 class PlanResponse(BaseModel):
@@ -95,6 +103,7 @@ class ExecuteRequest(BaseModel):
 class BenchmarkRequest(BaseModel):
     path: str | None = None
     synthetic_files: int = Field(default=0, ge=0, le=2000)
+    repetitions: int = Field(default=3, ge=1, le=9)
 
 
 class BenchmarkResponse(BaseModel):
@@ -113,6 +122,12 @@ class BenchmarkResponse(BaseModel):
     local_model_requests: int
     throughput: float
     classification_quality: str
+    optimized_cold: dict[str, Any] = Field(default_factory=dict)
+    samples: dict[str, list[float]] = Field(default_factory=dict)
+    discovery_ms: float = 0
+    results_match: bool = True
+    speedup_warm_vs_baseline: float = 0
+    methodology: str = ""
 
 
 class ModelSettings(BaseModel):
@@ -127,15 +142,42 @@ class OllamaClassification(BaseModel):
     @field_validator("category", mode="before")
     @classmethod
     def normalize_category(cls, value: Any) -> Any:
-        return value.lower() if isinstance(value, str) else value
+        return value.strip().lower() if isinstance(value, str) else value
+
+    @field_validator("proposed_name", mode="before")
+    @classmethod
+    def strip_name(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def trim_reason(cls, value: Any) -> Any:
+        return value.strip()[:500] if isinstance(value, str) else value
+
+
+def unsafe_name_reason(name: str) -> str | None:
+    """Why `name` must not be used as a single file name, or None when it is acceptable."""
+    if not name or name in {".", ".."}:
+        return "The proposed filename is empty or a relative path component."
+    if not SAFE_NAME.fullmatch(name):
+        return "The proposed filename contains path separators or control characters."
+    if len(name) > 255:
+        return "The proposed filename is longer than 255 characters."
+    if name != name.strip() or name.endswith("."):
+        return "The proposed filename has leading or trailing spaces or a trailing dot."
+    if any(char in name for char in '<>:"|?*'):
+        return "The proposed filename contains characters that Windows does not allow."
+    if name.split(".")[0].strip().lower() in WINDOWS_RESERVED_NAMES:
+        return "The proposed filename is a reserved Windows device name."
+    return None
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def db() -> sqlite3.Connection:
-    connection = sqlite3.connect(DB_PATH, timeout=10)
+def db(path: Path | None = None) -> sqlite3.Connection:
+    connection = sqlite3.connect(path or DB_PATH, timeout=10)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA journal_mode=WAL")
     connection.executescript(
@@ -168,6 +210,7 @@ def db() -> sqlite3.Connection:
             cache_schema_version INTEGER NOT NULL,
             processing_version TEXT NOT NULL,
             updated_at TEXT NOT NULL,
+            details TEXT,
             PRIMARY KEY (workspace_root, relative_path)
         );
         CREATE TABLE IF NOT EXISTS settings (
@@ -176,6 +219,9 @@ def db() -> sqlite3.Connection:
         );
         """
     )
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(processing_cache)")}
+    if "details" not in columns:  # databases created before model suggestions were persisted
+        connection.execute("ALTER TABLE processing_cache ADD COLUMN details TEXT")
     connection.commit()
     return connection
 
@@ -224,6 +270,24 @@ def content_fingerprint(path: Path) -> str:
     return digest.hexdigest()
 
 
+def is_cloud_placeholder(path: Path) -> bool:
+    """True for OneDrive-style files whose content is not local; hashing them would download them."""
+    try:
+        return bool(getattr(path.stat(), "st_file_attributes", 0) & CLOUD_ONLY_ATTRIBUTES)
+    except OSError:
+        return False
+
+
+def identity_fingerprint(path: Path) -> str | None:
+    """SHA-256 used to detect a changed source, or None when hashing is too costly or would download the file."""
+    try:
+        if path.stat().st_size > FINGERPRINT_LIMIT_BYTES or is_cloud_placeholder(path):
+            return None
+        return content_fingerprint(path)
+    except OSError:
+        return None
+
+
 def suffix_category(path: Path) -> str | None:
     extension = path.suffix.lower().lstrip(".")
     for category, extensions in EASY_EXTENSIONS.items():
@@ -249,16 +313,49 @@ def file_item(path: Path, root: Path, classification: dict[str, Any] | None = No
     return result
 
 
-def scan_files(root: Path) -> list[Path]:
+def scan_directory(root: Path) -> tuple[list[Path], bool]:
+    """Return eligible files (capped at MAX_SCAN_ENTRIES) and whether more eligible files were left unscanned."""
     items: list[Path] = []
     for path in sorted(root.rglob("*"), key=lambda item: str(item).lower()):
-        if len(items) >= MAX_SCAN_ENTRIES:
-            break
         if path.resolve() == DB_PATH.resolve():
             continue
         if path.is_file() and is_symlink_safe(path, root):
+            if len(items) >= MAX_SCAN_ENTRIES:
+                return items, True
             items.append(path)
-    return items
+    return items, False
+
+
+def scan_files(root: Path) -> list[Path]:
+    return scan_directory(root)[0]
+
+
+def completeness(root: Path, scanned: int, truncated: bool) -> dict[str, Any]:
+    return {
+        "scan_root": str(root),
+        "files_scanned": scanned,
+        "limit": MAX_SCAN_ENTRIES,
+        "truncated": truncated,
+        "complete": not truncated,
+    }
+
+
+def resolve_plan_sources(root: Path, raw_files: list[str]) -> list[Path]:
+    """Resolve selected files, requiring each to be a regular, non-symlinked file inside the selected root."""
+    if root == root.parent:
+        raise HTTPException(status_code=400, detail="A filesystem root cannot be used as a workspace.")
+    sources: list[Path] = []
+    for raw in raw_files:
+        candidate = Path(raw).expanduser()
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=f"{raw} is outside the selected workspace.") from error
+        if candidate.is_symlink() or resolved.is_symlink() or not resolved.is_file():
+            raise HTTPException(status_code=400, detail=f"{raw} must be an existing regular file (symbolic links are not accepted).")
+        sources.append(resolved)
+    return list(dict.fromkeys(sources))
 
 
 def deterministic_classification(path: Path) -> tuple[str, str]:
@@ -293,47 +390,126 @@ def ollama_models() -> list[str]:
 def classify_with_ollama(path: Path, model: str) -> OllamaClassification:
     host, _ = ollama_settings()
     prompt = (
-        "Classify this file using only metadata. Return JSON with category, proposed_name, and reason. "
-        f"Allowed categories: {', '.join(sorted(ALLOWED_CATEGORIES))}. "
-        f"Filename: {path.name}; extension: {path.suffix.lower()}; size_bytes: {path.stat().st_size}."
+        "You classify files using ONLY their metadata. Respond with one JSON object and nothing else, "
+        'with exactly these keys: "category", "proposed_name", "reason". '
+        f"category must be one of: {', '.join(sorted(ALLOWED_CATEGORIES))}. "
+        "proposed_name must be a single file name with no folders and the same extension as the original. "
+        "reason is one short sentence. "
+        f"Filename: {path.name}; extension: {path.suffix.lower() or 'none'}; size_bytes: {path.stat().st_size}."
     )
     request = urllib.request.Request(
         f"{host}/api/generate",
-        data=json.dumps({"model": model, "prompt": prompt, "format": "json", "stream": False}).encode("utf-8"),
+        data=json.dumps({
+            "model": model, "prompt": prompt, "format": "json", "stream": False, "options": {"temperature": 0},
+        }).encode("utf-8"),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=4.0) as response:
+    with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT_SECONDS) as response:
         payload = json.loads(response.read())
-    raw = payload.get("response")
+    raw = payload.get("response") if isinstance(payload, dict) else None
     if not isinstance(raw, str):
         raise ValueError("Ollama returned no structured response.")
     parsed = OllamaClassification.model_validate(json.loads(raw))
-    if not SAFE_NAME.fullmatch(parsed.proposed_name) or Path(parsed.proposed_name).name != parsed.proposed_name:
-        raise ValueError("Ollama proposed an unsafe filename.")
+    problem = unsafe_name_reason(parsed.proposed_name)
+    if problem or Path(parsed.proposed_name).name != parsed.proposed_name:
+        raise ValueError(problem or "Ollama proposed a path instead of a file name.")
     if Path(parsed.proposed_name).suffix.lower() != path.suffix.lower():
-        parsed.proposed_name = path.name
+        parsed.proposed_name = path.name  # never let the model change the file type
     return parsed
 
 
-def classify_file(path: Path, use_ai: bool) -> tuple[str, str, str, str | None, bool]:
+class Classification:
+    """Outcome of classifying one file. `failed` means a model call was attempted and had to fall back."""
+
+    def __init__(self, category: str, source: str, reason: str, proposed_name: str | None = None,
+                 attempted_model: bool = False, failed: bool = False, model: str | None = None) -> None:
+        self.category, self.source, self.reason, self.proposed_name = category, source, reason, proposed_name
+        self.attempted_model, self.failed, self.model = attempted_model, failed, model
+
+
+class ModelSession:
+    """Per-scan view of the optional local model: resolves availability once and bounds the work done."""
+
+    def __init__(self, use_ai: bool) -> None:
+        self.use_ai = use_ai
+        self._resolved = False
+        self._model: str | None = None
+        self.requests = 0
+        self.consecutive_failures = 0
+
+    @property
+    def model(self) -> str | None:
+        if not self._resolved:
+            self._resolved = True
+            selected = ollama_settings()[1] if self.use_ai else None
+            if selected and selected in ollama_models():
+                self._model = selected
+        return self._model
+
+    def exhausted_reason(self) -> str | None:
+        if self.requests >= MAX_CLASSIFICATION_BATCH:
+            return f"the {MAX_CLASSIFICATION_BATCH}-request limit for one scan was reached"
+        if self.consecutive_failures >= MAX_CONSECUTIVE_MODEL_FAILURES:
+            return "the model failed repeatedly during this scan"
+        return None
+
+
+def classify_file(path: Path, session: ModelSession) -> Classification:
     easy = suffix_category(path)
     if easy:
-        return easy, "local-rule", "Deterministic extension rule avoided an inference request.", None, False
-    model = ollama_settings()[1]
-    if use_ai and model and model in ollama_models():
-        try:
-            result = classify_with_ollama(path, model)
-            return result.category, "ollama", result.reason, result.proposed_name, True
-        except (OSError, ValueError, ValidationError, json.JSONDecodeError, urllib.error.URLError):
-            category, reason = deterministic_classification(path)
-            return category, "local-rule", f"Ollama response was unavailable or invalid; {reason}", None, True
-    category, reason = deterministic_classification(path)
-    return category, "local-rule", reason, None, False
+        return Classification(easy, "local-rule", "Deterministic extension rule avoided an inference request.")
+    category, rule_reason = deterministic_classification(path)
+    model = session.model
+    if not model:
+        return Classification(category, "local-rule", rule_reason)
+    limit = session.exhausted_reason()
+    if limit:
+        return Classification(category, "local-rule", f"Model skipped because {limit}; {rule_reason}", failed=True)
+    session.requests += 1
+    try:
+        result = classify_with_ollama(path, model)
+    except (OSError, ValueError, ValidationError, urllib.error.URLError) as error:  # JSONDecodeError is a ValueError
+        session.consecutive_failures += 1
+        return Classification(
+            category, "local-rule",
+            f"Ollama response was unavailable or invalid ({type(error).__name__}); {rule_reason}",
+            attempted_model=True, failed=True, model=model,
+        )
+    session.consecutive_failures = 0
+    return Classification(result.category, "ollama", result.reason, result.proposed_name, attempted_model=True, model=model)
 
 
-def classify_scan(root: Path, files: list[Path], use_ai: bool) -> tuple[list[dict[str, Any]], dict[str, int]]:
-    connection = db()
+def parse_details(raw: str | None) -> dict[str, Any]:
+    try:
+        value = json.loads(raw) if raw else {}
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def cached_row_is_current(cached: sqlite3.Row | None, path: Path, stat: os.stat_result) -> bool:
+    """A cache row may be reused only if it was fully computed by this version for this exact file state."""
+    if cached is None:
+        return False
+    if not (
+        cached["cache_schema_version"] == CACHE_SCHEMA_VERSION
+        and cached["processing_version"] == PROCESSING_VERSION
+        and cached["processing_status"] == "complete"
+        and cached["file_size"] == stat.st_size
+        and cached["mtime_ns"] == stat.st_mtime_ns
+    ):
+        return False
+    if cached["content_fingerprint"]:
+        return cached["content_fingerprint"] == identity_fingerprint(path)
+    return True
+
+
+def classify_scan(
+    root: Path, files: list[Path], use_ai: bool, connection: sqlite3.Connection | None = None
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    owns_connection = connection is None
+    connection = connection or db()
     rows = {
         row["relative_path"]: row
         for row in connection.execute(
@@ -344,70 +520,107 @@ def classify_scan(root: Path, files: list[Path], use_ai: bool) -> tuple[list[dic
     connection.execute("DELETE FROM processing_cache WHERE workspace_root = ? AND relative_path NOT IN ({})".format(
         ",".join("?" for _ in current_paths) or "''"
     ), (str(root), *current_paths))
+    session = ModelSession(use_ai)
     results: list[dict[str, Any]] = []
-    stats = {"cache_hits": 0, "cache_misses": 0, "model_requests": 0, "reprocessed": 0}
+    stats = {"cache_hits": 0, "cache_misses": 0, "model_requests": 0, "reprocessed": 0, "model_fallbacks": 0}
     for path in files:
         relative = root_relative(path, root)
         stat = path.stat()
         cached = rows.get(relative)
-        category: str
-        source: str
-        reason: str
-        proposed_name: str | None
-        reusable = (
-            cached is not None
-            and cached["cache_schema_version"] == CACHE_SCHEMA_VERSION
-            and cached["processing_version"] == PROCESSING_VERSION
-            and cached["processing_status"] == "complete"
-            and cached["file_size"] == stat.st_size
-            and cached["mtime_ns"] == stat.st_mtime_ns
-        )
-        if cached and cached["content_fingerprint"]:
-            reusable = reusable and cached["content_fingerprint"] == content_fingerprint(path)
+        ambiguous = suffix_category(path) is None
+        reusable = cached_row_is_current(cached, path, stat)
+        details = parse_details(cached["details"]) if cached is not None else {}
+        if reusable and ambiguous and session.use_ai:
+            # A rule-only or other-model answer is stale once a (different) model is available to improve it.
+            current_model = session.model
+            if current_model and (cached["classification_source"] != "ollama" or details.get("model") != current_model):
+                reusable = False
         if reusable:
-            category, source, reason, proposed_name = (
-                cached["classification"], f"cache:{cached['classification_source']}", "Reused a valid cached classification.", None
-            )
             stats["cache_hits"] += 1
+            category, source = cached["classification"], f"cache:{cached['classification_source']}"
+            reason = details.get("reason") or "Reused a valid cached classification."
+            proposed_name = details.get("proposed_name")
         else:
             stats["cache_misses"] += 1
             if cached:
                 stats["reprocessed"] += 1
+            fingerprint = identity_fingerprint(path) if ambiguous else None
             connection.execute(
                 """
-                INSERT INTO processing_cache VALUES (?, ?, ?, ?, NULL, ?, ?, 'processing', ?, ?, ?)
+                INSERT INTO processing_cache (workspace_root, relative_path, file_size, mtime_ns, content_fingerprint,
+                    classification, classification_source, processing_status, cache_schema_version,
+                    processing_version, updated_at, details)
+                VALUES (?, ?, ?, ?, NULL, 'pending', 'pending', 'processing', ?, ?, ?, NULL)
                 ON CONFLICT(workspace_root, relative_path) DO UPDATE SET
-                file_size=excluded.file_size, mtime_ns=excluded.mtime_ns,
-                processing_status='processing', updated_at=excluded.updated_at
+                file_size=excluded.file_size, mtime_ns=excluded.mtime_ns, content_fingerprint=NULL,
+                processing_status='processing', details=NULL, updated_at=excluded.updated_at
                 """,
-                (str(root), relative, stat.st_size, stat.st_mtime_ns, "pending", "pending",
-                 CACHE_SCHEMA_VERSION, PROCESSING_VERSION, utc_now()),
+                (str(root), relative, stat.st_size, stat.st_mtime_ns, CACHE_SCHEMA_VERSION, PROCESSING_VERSION, utc_now()),
             )
-            category, source, reason, proposed_name, attempted_model = classify_file(path, use_ai)
-            if attempted_model:
+            result = classify_file(path, session)
+            if result.attempted_model:
                 stats["model_requests"] += 1
-            fingerprint = content_fingerprint(path) if suffix_category(path) is None else None
+            if result.failed:
+                stats["model_fallbacks"] += 1
+            category, source, reason, proposed_name = result.category, result.source, result.reason, result.proposed_name
+            stored_details = json.dumps({"model": result.model, "proposed_name": proposed_name, "reason": reason}) if source == "ollama" else None
+            # A fallback after a failed or skipped model call is not final: leave it incomplete so the next scan retries.
+            status = "fallback" if result.failed else "complete"
             connection.execute(
                 """
                 UPDATE processing_cache SET content_fingerprint=?, classification=?, classification_source=?,
-                processing_status='complete', updated_at=? WHERE workspace_root=? AND relative_path=?
+                processing_status=?, details=?, updated_at=? WHERE workspace_root=? AND relative_path=?
                 """,
-                (fingerprint, category, source, utc_now(), str(root), relative),
+                (fingerprint, category, source, status, stored_details, utc_now(), str(root), relative),
             )
         results.append(file_item(path, root, {
             "category": category, "classification_source": source, "classification_reason": reason,
             "proposed_name": proposed_name or path.name,
         }))
     connection.commit()
-    connection.close()
+    if owns_connection:
+        connection.close()
     return results, stats
+
+
+def classify_without_cache(root: Path, files: list[Path]) -> list[dict[str, Any]]:
+    """The no-cache baseline: same inputs and output shape as classify_scan, deterministic rules only."""
+    items = []
+    for path in files:
+        category, reason = deterministic_classification(path)
+        items.append(file_item(path, root, {
+            "category": category, "classification_source": "local-rule", "classification_reason": reason,
+            "proposed_name": path.name,
+        }))
+    return items
+
+
+def plan_suggestion(connection: sqlite3.Connection, root: Path, path: Path) -> dict[str, Any] | None:
+    """A still-valid, safety-checked model suggestion cached for this file, or None to use the deterministic rule."""
+    try:
+        cached = connection.execute(
+            "SELECT * FROM processing_cache WHERE workspace_root = ? AND relative_path = ?",
+            (str(root), root_relative(path, root)),
+        ).fetchone()
+        if cached is None or cached["classification_source"] != "ollama" or not cached_row_is_current(cached, path, path.stat()):
+            return None
+    except (OSError, sqlite3.Error, HTTPException):
+        return None
+    details = parse_details(cached["details"])
+    category, name = cached["classification"], details.get("proposed_name")
+    if category not in ALLOWED_CATEGORIES:
+        return None
+    if not isinstance(name, str) or unsafe_name_reason(name) or Path(name).suffix.lower() != path.suffix.lower():
+        name = None
+    return {"category": category, "proposed_name": name, "reason": str(details.get("reason") or ""), "model": details.get("model")}
 
 
 def validate_action(source: Path, destination: Path, root: Path) -> tuple[str, str]:
     if not is_symlink_safe(source, root) or destination.is_symlink():
         return "blocked", "Symbolic links are not accepted for file operations."
-    if not SAFE_NAME.fullmatch(destination.name):
-        return "blocked", "The proposed filename contains path separators or control characters."
+    name_problem = unsafe_name_reason(destination.name)
+    if name_problem:
+        return "blocked", name_problem
     root = root.resolve()
     destination = destination.resolve()
     try:
@@ -424,22 +637,26 @@ def validate_action(source: Path, destination: Path, root: Path) -> tuple[str, s
     return "safe", "Destination is inside the workspace and currently unused."
 
 
-def action_for(source: Path, root: Path, proposed_name: str | None = None) -> PlanAction:
+def action_for(
+    source: Path, root: Path, proposed_name: str | None = None, category: str | None = None,
+    source_type: Literal["local-rule", "ollama"] = "local-rule", note: str = "",
+) -> PlanAction:
     name = proposed_name or source.name
-    category_dir = root / (suffix_category(source) or "other")
-    destination = category_dir / name
-    if not SAFE_NAME.fullmatch(name):
-        validation, reason = "blocked", "The proposed filename contains path separators or control characters."
+    category = category if category in ALLOWED_CATEGORIES else (suffix_category(source) or "other")
+    # The category folder (one of a fixed set) sits beside the file; `root` is only the safety boundary.
+    destination = source.parent / category / name
+    name_problem = unsafe_name_reason(name)
+    if name_problem:
+        validation, reason = "blocked", name_problem
     else:
         validation, reason = validate_action(source, destination, root)
     stat = source.stat()
-    fingerprint = content_fingerprint(source) if suffix_category(source) is None else None
     action_id = hashlib.sha256(f"{root}:{source}:{destination}".encode()).hexdigest()[:16]
     return PlanAction(
         id=action_id, source=str(source), proposed_name=name, current_location=str(source.parent),
-        proposed_destination=str(destination), source_type="local-rule", validation=validation,
-        reason=reason, workspace_root=str(root), source_size=stat.st_size, source_mtime_ns=stat.st_mtime_ns,
-        source_fingerprint=fingerprint,
+        proposed_destination=str(destination), source_type=source_type, validation=validation,
+        reason=f"{reason} {note}".strip(), workspace_root=str(root), source_size=stat.st_size,
+        source_mtime_ns=stat.st_mtime_ns, source_fingerprint=identity_fingerprint(source), category=category,
     )
 
 
@@ -476,22 +693,43 @@ def update_settings(request: ModelSettings) -> ModelSettings:
 def scan(request: ScanRequest) -> dict[str, Any]:
     root = resolved_directory(request.path)
     started = time.perf_counter()
-    items, stats = classify_scan(root, scan_files(root), request.use_ai)
+    files, truncated = scan_directory(root)
+    items, stats = classify_scan(root, files, request.use_ai)
     duration_ms = max(1, round((time.perf_counter() - started) * 1000))
-    record_activity("scan", f"Scanned {root} ({len(items)} files, {stats['cache_hits']} cache hits)")
-    return {"path": str(root), "items": items, "count": len(items), "processing": {**stats, "duration_ms": duration_ms}}
+    note = f" INCOMPLETE: stopped at the {MAX_SCAN_ENTRIES}-file limit" if truncated else ""
+    record_activity("scan", f"Scanned {root} ({len(items)} files, {stats['cache_hits']} cache hits){note}")
+    return {
+        "path": str(root), "items": items, "count": len(items),
+        "completeness": completeness(root, len(items), truncated),
+        "processing": {**stats, "duration_ms": duration_ms},
+    }
 
 
 @app.post("/api/plans", response_model=PlanResponse)
 def plans(request: PlanRequest) -> PlanResponse:
     if not request.files:
         raise HTTPException(status_code=400, detail="Select at least one file to create a plan.")
-    unresolved = [Path(raw).expanduser() for raw in request.files]
-    paths = [path.resolve() for path in unresolved]
-    roots = {path.parent for path in paths}
-    if len(roots) != 1 or any(not path.is_file() or path.is_symlink() for path in paths) or any(path.is_symlink() for path in unresolved):
-        raise HTTPException(status_code=400, detail="Files must exist, be regular files, and share one parent directory.")
-    actions = [action_for(path, next(iter(roots))) for path in paths]
+    root = resolved_directory(request.workspace_root)
+    paths = resolve_plan_sources(root, request.files)
+    actions = []
+    connection = db()
+    try:
+        for path in paths:
+            suggestion = plan_suggestion(connection, root, path)
+            if suggestion:
+                renamed = suggestion["proposed_name"] if suggestion["proposed_name"] != path.name else None
+                note = f"Suggested by Ollama ({suggestion['model']}): {suggestion['reason']}".strip()
+                actions.append(action_for(path, root, renamed, suggestion["category"], "ollama", note))
+            else:
+                actions.append(action_for(path, root))
+    finally:
+        connection.close()
+    claimed: dict[str, int] = {}
+    for index, action in enumerate(actions):
+        if action.proposed_destination in claimed and action.validation != "blocked":
+            action.validation = "blocked"
+            action.reason = "Another proposal in this plan targets the same destination."
+        claimed.setdefault(action.proposed_destination, index)
     plan = PlanResponse(id=hashlib.sha256(f"{utc_now()}:{paths}".encode()).hexdigest()[:16], created_at=utc_now(), actions=actions)
     connection = db()
     connection.execute("INSERT INTO plans VALUES (?, ?, ?)", (plan.id, plan.created_at, json.dumps([item.model_dump() for item in actions])))
@@ -531,7 +769,8 @@ def edit_action(plan_id: str, action_id: str, request: EditActionRequest) -> Pla
     if not source.is_file() or source.is_symlink():
         action.validation, action.reason = "blocked", "The source file is stale or no longer a regular file."
     else:
-        updated = action_for(source, Path(action.workspace_root), request.proposed_name)
+        # Keep the category (including a model-chosen one) while the name is user-edited.
+        updated = action_for(source, Path(action.workspace_root), request.proposed_name, category=action.category or None)
         action.proposed_name, action.proposed_destination = updated.proposed_name, updated.proposed_destination
         action.validation, action.reason = updated.validation, updated.reason
     # Any edit voids a previous approval; a rejection is never silently reversed.
@@ -680,64 +919,124 @@ def execute(request: ExecuteRequest) -> dict[str, Any]:
 @app.post("/api/duplicates")
 def duplicates(request: ScanRequest) -> dict[str, Any]:
     root = resolved_directory(request.path)
-    groups: dict[tuple[int, str], list[str]] = {}
-    for path in scan_files(root):
+    files, truncated = scan_directory(root)
+    by_size: dict[int, list[Path]] = {}
+    for path in files:
         try:
-            fingerprint = content_fingerprint(path)
-            groups.setdefault((path.stat().st_size, fingerprint), []).append(str(path))
+            by_size.setdefault(path.stat().st_size, []).append(path)
         except OSError:
             continue
-    matches = [{"size": size, "fingerprint": fingerprint, "files": files} for (size, fingerprint), files in groups.items() if len(files) > 1]
-    record_activity("duplicates", f"Found {len(matches)} exact duplicate group(s) in {root}")
-    return {"path": str(root), "groups": matches, "count": len(matches), "fingerprint": "SHA-256 content hash"}
+    groups: dict[tuple[int, str], list[str]] = {}
+    hashed = skipped_cloud = 0
+    for size, same_size in by_size.items():
+        if len(same_size) < 2:  # a file with a unique size cannot have an exact duplicate, so it is never read
+            continue
+        for path in same_size:
+            if is_cloud_placeholder(path):  # hashing would download the file from the cloud
+                skipped_cloud += 1
+                continue
+            try:
+                fingerprint = content_fingerprint(path)
+            except OSError:
+                continue
+            hashed += 1
+            groups.setdefault((size, fingerprint), []).append(str(path))
+    matches = [{"size": size, "fingerprint": fingerprint, "files": names} for (size, fingerprint), names in groups.items() if len(names) > 1]
+    note = f", {skipped_cloud} cloud-only file(s) not read" if skipped_cloud else ""
+    record_activity("duplicates", f"Found {len(matches)} exact duplicate group(s) in {root}{note}")
+    return {
+        "path": str(root), "groups": matches, "count": len(matches), "fingerprint": "SHA-256 content hash",
+        "completeness": completeness(root, len(files), truncated),
+        "files_hashed": hashed, "skipped_cloud_only": skipped_cloud,
+    }
 
 
-def benchmark_once(root: Path, use_cache: bool) -> dict[str, Any]:
+BENCHMARK_METHODOLOGY = (
+    "Every phase classifies the same file list. 'No cache' applies the deterministic extension rules directly; "
+    "'cold cache' is the first cached pass over an empty temporary SQLite cache; 'warm cache' is a second pass over the "
+    "unchanged files. Each phase is repeated with a fresh temporary cache and the median is reported. The application "
+    "database and its processing cache are neither read nor written by the timed phases. Deterministic extension "
+    "lookup needs no cache, so a warm cache is not expected to beat it; the cache exists to avoid repeated model "
+    "requests, which this benchmark does not exercise (model requests are always 0)."
+)
+
+
+def median(values: list[float]) -> float:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    return ordered[middle] if len(ordered) % 2 else (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def timed(function: Any, *args: Any) -> tuple[Any, float]:
     started = time.perf_counter()
-    files = scan_files(root)
-    if use_cache:
-        _, stats = classify_scan(root, files, use_ai=False)
-    else:
-        stats = {"cache_hits": 0, "cache_misses": len(files), "model_requests": 0, "reprocessed": 0}
-        for path in files:
-            deterministic_classification(path)
-    duration = max(1, round((time.perf_counter() - started) * 1000))
-    return {"files": len(files), "processed": stats["cache_misses"], "cache_hits": stats["cache_hits"], "duration_ms": duration}
+    result = function(*args)
+    return result, (time.perf_counter() - started) * 1000
 
 
 @app.post("/api/benchmarks", response_model=BenchmarkResponse)
 def benchmark(request: BenchmarkRequest) -> BenchmarkResponse:
     temporary: tempfile.TemporaryDirectory[str] | None = None
-    if request.synthetic_files:
-        temporary = tempfile.TemporaryDirectory(prefix="lazydesk-benchmark-")
-        root = Path(temporary.name)
-        for index in range(request.synthetic_files):
-            (root / f"sample-{index:04d}.txt").write_text(f"deterministic sample {index}\n", encoding="utf-8")
-    elif request.path:
-        root = resolved_directory(request.path)
-    else:
-        raise HTTPException(status_code=400, detail="Provide a workspace path or synthetic_files count.")
-    cold = benchmark_once(root, use_cache=False)
-    optimized_cold = benchmark_once(root, use_cache=True)
-    warm = benchmark_once(root, use_cache=True)
-    warm["optimized_cold_duration_ms"] = optimized_cold["duration_ms"]
-    payload = BenchmarkResponse(
-        id=hashlib.sha256(f"{root}:{utc_now()}".encode()).hexdigest()[:16], created_at=utc_now(),
-        path=str(root), mode="synthetic" if temporary else "workspace", cold=cold, warm=warm,
-        baseline_duration_ms=cold["duration_ms"], optimized_duration_ms=warm["duration_ms"],
-        files_discovered=warm["files"], unchanged_files_skipped=warm["cache_hits"],
-        cache_hits=warm["cache_hits"], cache_misses=warm["processed"], local_model_requests=0,
-        throughput=round(warm["files"] / (warm["duration_ms"] / 1000), 2) if warm["duration_ms"] else 0,
-        classification_quality="Deterministic categories; no labeled accuracy set supplied.",
-    )
-    connection = db()
-    connection.execute("INSERT INTO benchmarks VALUES (?, ?, ?)", (payload.id, payload.created_at, payload.model_dump_json()))
-    connection.commit()
-    connection.close()
-    if temporary:
-        temporary.cleanup()
-    record_activity("benchmark", f"Benchmarked {root} ({warm['files']} files, cold and warm)")
-    return payload
+    try:
+        if request.synthetic_files:
+            temporary = tempfile.TemporaryDirectory(prefix="lazydesk-benchmark-")
+            root = Path(temporary.name).resolve()
+            for index in range(request.synthetic_files):
+                suffix = "dat" if index % 10 == 0 else "txt"  # a tenth have no deterministic extension rule
+                (root / f"sample-{index:04d}.{suffix}").write_text(f"deterministic sample {index}\n", encoding="utf-8")
+        elif request.path:
+            root = resolved_directory(request.path)
+        else:
+            raise HTTPException(status_code=400, detail="Provide a workspace path or synthetic_files count.")
+        (files, truncated), discovery_ms = timed(scan_directory, root)
+        samples: dict[str, list[float]] = {"no_cache": [], "cold_cache": [], "warm_cache": []}
+        results_match, cold_stats, warm_stats = True, {}, {}
+
+        def signature(items: list[dict[str, Any]]) -> list[tuple[str, str]]:
+            return [(item["relative_path"], item["category"]) for item in items]
+
+        for _ in range(request.repetitions):
+            baseline_items, elapsed = timed(classify_without_cache, root, files)
+            samples["no_cache"].append(elapsed)
+            with tempfile.TemporaryDirectory(prefix="lazydesk-benchmark-cache-") as cache_dir:
+                cache = db(Path(cache_dir) / "cache.sqlite")
+                try:
+                    (cold_items, cold_stats), elapsed = timed(classify_scan, root, files, False, cache)
+                    samples["cold_cache"].append(elapsed)
+                    (warm_items, warm_stats), elapsed = timed(classify_scan, root, files, False, cache)
+                    samples["warm_cache"].append(elapsed)
+                finally:
+                    cache.close()
+            results_match = results_match and signature(baseline_items) == signature(cold_items) == signature(warm_items)
+        medians = {name: round(median(values), 3) for name, values in samples.items()}
+        count = len(files)
+        phases = {
+            "cold": {"files": count, "processed": count, "cache_hits": 0, "duration_ms": medians["no_cache"]},
+            "optimized_cold": {"files": count, "processed": cold_stats["cache_misses"], "cache_hits": cold_stats["cache_hits"], "duration_ms": medians["cold_cache"]},
+            "warm": {"files": count, "processed": warm_stats["cache_misses"], "cache_hits": warm_stats["cache_hits"], "duration_ms": medians["warm_cache"]},
+        }
+        warm_ms = medians["warm_cache"]
+        payload = BenchmarkResponse(
+            id=hashlib.sha256(f"{root}:{utc_now()}".encode()).hexdigest()[:16], created_at=utc_now(),
+            path=str(root), mode="synthetic" if temporary else "workspace", cold=phases["cold"], warm=phases["warm"],
+            optimized_cold=phases["optimized_cold"], samples={name: [round(v, 3) for v in values] for name, values in samples.items()},
+            baseline_duration_ms=max(1, round(medians["no_cache"])), optimized_duration_ms=max(1, round(warm_ms)),
+            files_discovered=count, unchanged_files_skipped=warm_stats["cache_hits"],
+            cache_hits=warm_stats["cache_hits"], cache_misses=warm_stats["cache_misses"], local_model_requests=0,
+            throughput=round(count / (warm_ms / 1000), 2) if warm_ms else 0,
+            classification_quality="Deterministic categories; no labeled accuracy set supplied.",
+            discovery_ms=round(discovery_ms, 3), results_match=results_match,
+            speedup_warm_vs_baseline=round(medians["no_cache"] / warm_ms, 2) if warm_ms else 0,
+            methodology=BENCHMARK_METHODOLOGY + (f" Discovery stopped at the {MAX_SCAN_ENTRIES}-file limit." if truncated else ""),
+        )
+        connection = db()
+        connection.execute("INSERT INTO benchmarks VALUES (?, ?, ?)", (payload.id, payload.created_at, payload.model_dump_json()))
+        connection.commit()
+        connection.close()
+        record_activity("benchmark", f"Benchmarked {root} ({count} files, {request.repetitions} repetition(s))")
+        return payload
+    finally:
+        if temporary:
+            temporary.cleanup()
 
 
 @app.get("/api/activity")

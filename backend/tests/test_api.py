@@ -25,6 +25,6 @@ def test_scan_and_plan(tmp_path: Path):
     assert scan_response.status_code == 200
     assert scan_response.json()["count"] == 1
 
-    plan_response = client.post("/api/plans", json={"files": [str(document)]})
+    plan_response = client.post("/api/plans", json={"workspace_root": str(tmp_path), "files": [str(document)]})
     assert plan_response.status_code == 200
     assert plan_response.json()["actions"][0]["validation"] == "warning"

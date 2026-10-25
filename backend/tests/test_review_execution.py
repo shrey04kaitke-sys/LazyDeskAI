@@ -18,8 +18,8 @@ def client() -> TestClient:
     return TestClient(main.app)
 
 
-def make_plan(client: TestClient, *files: Path) -> dict:
-    response = client.post("/api/plans", json={"files": [str(item) for item in files]})
+def make_plan(client: TestClient, *files: Path, root: Path | None = None) -> dict:
+    response = client.post("/api/plans", json={"workspace_root": str(root or files[0].parent), "files": [str(item) for item in files]})
     assert response.status_code == 200, response.text
     return response.json()
 
@@ -230,6 +230,6 @@ def test_symlinked_source_is_not_accepted(workspace: Path, client: TestClient, t
         link.symlink_to(target)
     except (OSError, NotImplementedError):
         pytest.skip("symlinks unavailable on this system")
-    response = client.post("/api/plans", json={"files": [str(link)]})
+    response = client.post("/api/plans", json={"workspace_root": str(workspace), "files": [str(link)]})
     assert response.status_code == 400
     assert target.exists()

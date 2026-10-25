@@ -1,10 +1,13 @@
+import atexit
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
 # Must be set before app.main is imported so no test can ever resolve to backend/lazydesk.db.
 _TEST_DB_DIR = tempfile.mkdtemp(prefix="lazydesk-test-db-")
 os.environ["LAZYDESK_DB"] = str(Path(_TEST_DB_DIR) / "session.sqlite")
+atexit.register(shutil.rmtree, _TEST_DB_DIR, ignore_errors=True)
 
 import pytest  # noqa: E402
 
